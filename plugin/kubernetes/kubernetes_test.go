@@ -1,11 +1,12 @@
 package kubernetes
 
 import (
+	"context"
+	"net"
 	"testing"
 
 	"github.com/coredns/coredns/plugin"
 	"github.com/coredns/coredns/plugin/kubernetes/object"
-	"github.com/coredns/coredns/plugin/pkg/watch"
 	"github.com/coredns/coredns/request"
 
 	"github.com/miekg/dns"
@@ -66,9 +67,6 @@ func (APIConnServiceTest) PodIndex(string) []*object.Pod             { return ni
 func (APIConnServiceTest) SvcIndexReverse(string) []*object.Service  { return nil }
 func (APIConnServiceTest) EpIndexReverse(string) []*object.Endpoints { return nil }
 func (APIConnServiceTest) Modified() int64                           { return 0 }
-func (APIConnServiceTest) SetWatchChan(watch.Chan)                   {}
-func (APIConnServiceTest) Watch(string) error                        { return nil }
-func (APIConnServiceTest) StopWatching(string)                       {}
 
 func (APIConnServiceTest) SvcIndex(string) []*object.Service {
 	svcs := []*object.Service{
@@ -257,7 +255,6 @@ func (APIConnServiceTest) GetNamespaceByName(name string) (*api.Namespace, error
 }
 
 func TestServices(t *testing.T) {
-
 	k := New([]string{"interwebs.test."})
 	k.APIConn = &APIConnServiceTest{}
 
@@ -272,12 +269,12 @@ func TestServices(t *testing.T) {
 	}
 	tests := []svcTest{
 		// Cluster IP Services
-		{qname: "svc1.testns.svc.interwebs.test.", qtype: dns.TypeA, answer: svcAns{host: "10.0.0.1", key: "/coredns/test/interwebs/svc/testns/svc1"}},
-		{qname: "_http._tcp.svc1.testns.svc.interwebs.test.", qtype: dns.TypeSRV, answer: svcAns{host: "10.0.0.1", key: "/coredns/test/interwebs/svc/testns/svc1"}},
-		{qname: "ep1a.svc1.testns.svc.interwebs.test.", qtype: dns.TypeA, answer: svcAns{host: "172.0.0.1", key: "/coredns/test/interwebs/svc/testns/svc1/ep1a"}},
+		{qname: "svc1.testns.svc.interwebs.test.", qtype: dns.TypeA, answer: svcAns{host: "10.0.0.1", key: "/" + coredns + "/test/interwebs/svc/testns/svc1"}},
+		{qname: "_http._tcp.svc1.testns.svc.interwebs.test.", qtype: dns.TypeSRV, answer: svcAns{host: "10.0.0.1", key: "/" + coredns + "/test/interwebs/svc/testns/svc1"}},
+		{qname: "ep1a.svc1.testns.svc.interwebs.test.", qtype: dns.TypeA, answer: svcAns{host: "172.0.0.1", key: "/" + coredns + "/test/interwebs/svc/testns/svc1/ep1a"}},
 
 		// External Services
-		{qname: "external.testns.svc.interwebs.test.", qtype: dns.TypeCNAME, answer: svcAns{host: "coredns.io", key: "/coredns/test/interwebs/svc/testns/external"}},
+		{qname: "external.testns.svc.interwebs.test.", qtype: dns.TypeCNAME, answer: svcAns{host: "coredns.io", key: "/" + coredns + "/test/interwebs/svc/testns/external"}},
 	}
 
 	for i, test := range tests {
@@ -285,13 +282,68 @@ func TestServices(t *testing.T) {
 			Req:  &dns.Msg{Question: []dns.Question{{Name: test.qname, Qtype: test.qtype}}},
 			Zone: "interwebs.test.", // must match from k.Zones[0]
 		}
-		svcs, e := k.Services(state, false, plugin.Options{})
+		svcs, e := k.Services(context.TODO(), state, false, plugin.Options{})
 		if e != nil {
 			t.Errorf("Test %d: got error '%v'", i, e)
 			continue
 		}
 		if len(svcs) != 1 {
-			t.Errorf("Test %d, expected expected 1 answer, got %v", i, len(svcs))
+			t.Errorf("Test %d, expected 1 answer, got %v", i, len(svcs))
+			continue
+		}
+
+		if test.answer.host != svcs[0].Host {
+			t.Errorf("Test %d, expected host '%v', got '%v'", i, test.answer.host, svcs[0].Host)
+		}
+		if test.answer.key != svcs[0].Key {
+			t.Errorf("Test %d, expected key '%v', got '%v'", i, test.answer.key, svcs[0].Key)
+		}
+	}
+}
+
+func TestServicesAuthority(t *testing.T) {
+	k := New([]string{"interwebs.test."})
+	k.APIConn = &APIConnServiceTest{}
+
+	type svcAns struct {
+		host string
+		key  string
+	}
+	type svcTest struct {
+		interfaceAddrs func() net.IP
+		qname          string
+		qtype          uint16
+		answer         *svcAns
+	}
+	tests := []svcTest{
+		{interfaceAddrs: func() net.IP { return net.ParseIP("127.0.0.1") }, qname: "ns.dns.interwebs.test.", qtype: dns.TypeA, answer: &svcAns{host: "127.0.0.1", key: "/" + coredns + "/test/interwebs/dns/ns"}},
+		{interfaceAddrs: func() net.IP { return net.ParseIP("127.0.0.1") }, qname: "ns.dns.interwebs.test.", qtype: dns.TypeAAAA},
+		{interfaceAddrs: func() net.IP { return net.ParseIP("::1") }, qname: "ns.dns.interwebs.test.", qtype: dns.TypeA},
+		{interfaceAddrs: func() net.IP { return net.ParseIP("::1") }, qname: "ns.dns.interwebs.test.", qtype: dns.TypeAAAA, answer: &svcAns{host: "::1", key: "/" + coredns + "/test/interwebs/dns/ns"}},
+	}
+
+	for i, test := range tests {
+		k.interfaceAddrsFunc = test.interfaceAddrs
+
+		state := request.Request{
+			Req:  &dns.Msg{Question: []dns.Question{{Name: test.qname, Qtype: test.qtype}}},
+			Zone: "interwebs.test.", // must match from k.Zones[0]
+		}
+		svcs, e := k.Services(context.TODO(), state, false, plugin.Options{})
+		if e != nil {
+			t.Errorf("Test %d: got error '%v'", i, e)
+			continue
+		}
+		if test.answer != nil && len(svcs) != 1 {
+			t.Errorf("Test %d, expected 1 answer, got %v", i, len(svcs))
+			continue
+		}
+		if test.answer == nil && len(svcs) != 0 {
+			t.Errorf("Test %d, expected no answer, got %v", i, len(svcs))
+			continue
+		}
+
+		if test.answer == nil && len(svcs) == 0 {
 			continue
 		}
 
